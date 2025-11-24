@@ -11,5 +11,12 @@
 			"binding": "STUDY_STATE_KV",
 			"id": "f06c493fdb4047bc9a46e7f86abc8ad3"
 		}
-	]
+	],
+	"ai": {
+		"binding": "AI"
+	},
+	"assets": {
+		"directory": "./pages",
+		"binding": "ASSETS"
+	}
 }
