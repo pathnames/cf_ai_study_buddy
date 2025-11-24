@@ -65,3 +65,9 @@ The application uses a **State-Aware Hybrid Architecture**:
 3.  **Routing:** A deterministic router classifies the intent (Plan, Log, or Chat). This ensures that requests to "Log a session" don't accidentally trigger a long lecture on history.
 4.  **Inference:** The Worker calls **Workers AI** with a system prompt tailored to the specific intent (e.g., specific instructions to be concise during planning).
 5.  **Persist:** The AI's response and any changes to the plan are saved back to KV immediately.
+
+⚠️ Note on Authentication
+
+For the purpose of this demo submission, the application utilizes a hardcoded demo-user ID to persist state in KV.
+
+In a production environment, this would be replaced by a secure authentication layer (e.g., Cloudflare Access or JWT verification via Auth0/Firebase).
