@@ -1,399 +1,469 @@
+/**
+ * Cloudflare Worker: AI Study Planner Agent
+ * 
+ * ARCHITECTURE OVERVIEW:
+ * 1. State Management: Uses Cloudflare KV to store user profiles, long-term session logs, 
+ *    and short-term conversation history.
+ * 2. Routing Logic: A deterministic router (`chooseAction`) analyzes the user's message 
+ *    to decide which "Tool" to use (Plan, Chat, Log, Analyze).
+ * 3. AI Execution: Uses `@cf/meta/llama-3.1-8b-instruct-fast`. This model is chosen for 
+ *    speed and low latency, which is crucial for a chat interface.
+ */
+
 const MODEL = "@cf/meta/llama-3.1-8b-instruct-fast";
 
+// Standard CORS headers to allow a frontend (likely running on localhost or a different domain)
+// to communicate with this worker.
 const CORS_HEADERS = {
-	"Access-Control-Allow-Origin": "*",
-	"Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-	"Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
 };
 
+// --- STATE MANAGEMENT ---
+
+/**
+ * Loads the user's state from Cloudflare KV.
+ * 
+ * DATA STRUCTURE:
+ * - profile: Static user preferences (e.g., "weakAreas").
+ * - recentHistory: Short-term memory (last few chat turns). Vital for the AI to understand context.
+ * - lastSession: The specific plan currently being worked on or discussed.
+ * - sessions: Long-term archival of all generated plans (used for pattern analysis).
+ */
 async function loadStudyState(env, userId) {
-	const key = `user:${userId}`;
-	const stored = await env.STUDY_STATE_KV.get(key, "json");
-	if (stored) {
-		// Ensure newer fields exist
-		return {
-			profile: stored.profile || {
-				prefersShortSentences: true,
-				weakAreas: [],
-			},
-			lastSession: stored.lastSession || null,
-			sessions: Array.isArray(stored.sessions) ? stored.sessions : [],
-			lastAnalysis: stored.lastAnalysis || null,
-		};
-	}
+  const key = `user:${userId}`;
+  const stored = await env.STUDY_STATE_KV.get(key, "json");
+  
+  const defaults = {
+    profile: {
+      prefersShortSentences: true,
+      weakAreas: [],
+    },
+    recentHistory: [], 
+    lastSession: null, 
+    sessions: [], 
+    lastAnalysis: null,
+  };
 
-	// default state if nothing is stored yet
-	return {
-		profile: {
-			prefersShortSentences: true,
-			weakAreas: [],
-		},
-		lastSession: null,
-		sessions: [],
-		lastAnalysis: null,
-	};
+  if (!stored) return defaults;
+
+  // Merge stored data with defaults to ensure all arrays exist 
+  // (prevents crashes if the schema changes later).
+  return {
+    ...defaults,
+    ...stored,
+    recentHistory: Array.isArray(stored.recentHistory) ? stored.recentHistory : [],
+    sessions: Array.isArray(stored.sessions) ? stored.sessions : [],
+  };
 }
 
+/**
+ * Saves state back to KV.
+ * 
+ * OPTIMIZATION:
+ * We slice `recentHistory` to the last 8 messages. 
+ * - Prevents the Context Window from overflowing (LLMs have limits).
+ * - Reduces KV storage costs.
+ * - Keeps the AI focused on the *immediate* conversation rather than old topics.
+ */
 async function saveStudyState(env, userId, state) {
-	const key = `user:${userId}`;
-	await env.STUDY_STATE_KV.put(key, JSON.stringify(state));
+  const key = `user:${userId}`;
+  
+  if (state.recentHistory.length > 8) {
+    state.recentHistory = state.recentHistory.slice(-8);
+  }
+  await env.STUDY_STATE_KV.put(key, JSON.stringify(state));
 }
 
-async function createPlan(state, message, env) {
-	const systemPrompt = `
-    You are a study planner.
+// --- HELPERS ---
 
-    User profile:
-    ${JSON.stringify(state.profile)}
-
-    Last session (may be null):
-    ${JSON.stringify(state.lastSession)}
-
-    The user will describe what they need to study and time.
-    Create a concrete plan for the next 60–90 minutes only, in bullet points.
-  `;
-
-	const aiResult = await env.AI.run(MODEL, {
-		messages: [
-			{ role: "system", content: systemPrompt },
-			{ role: "user", content: message },
-		],
-	});
-
-	const planText =
-		aiResult?.result || aiResult?.response || "Could not generate plan.";
-
-	const session = {
-		id: String(Date.now()),
-		timestamp: Date.now(),
-		goal: message,
-		action: "create_plan",
-		plan: planText,
-		outcomeNote: null,
-	};
-
-	const sessions = Array.isArray(state.sessions) ? state.sessions.slice() : [];
-	sessions.push(session);
-
-	const newState = {
-		...state,
-		lastSession: session,
-		sessions,
-	};
-
-	return { reply: planText, newState };
+/**
+ * Converts the array of message objects into a single string for the System Prompt.
+ * LLMs read text, not JSON objects, so this formatting is crucial for them 
+ * to understand "Who said what".
+ */
+function formatHistory(history) {
+  if (!history || history.length === 0) return "";
+  return history
+    .map((msg) => `${msg.role === "user" ? "User" : "Assistant"}: ${msg.content}`)
+    .join("\n");
 }
 
-async function revisePlan(state, message, env) {
-	const lastPlan = state.lastSession ? state.lastSession.plan : "(none)";
-	const goal =
-		(state.lastSession && state.lastSession.goal) || message || "(unspecified goal)";
-
-	const systemPrompt = `
-    You are revising an existing study plan.
-
-    Existing plan:
-    ${lastPlan}
-
-    The user will describe what didn't work or what changed.
-    Adjust the plan to fit the new constraints, keeping it realistic and concrete.
-  `;
-
-	const aiResult = await env.AI.run(MODEL, {
-		messages: [
-			{ role: "system", content: systemPrompt },
-			{ role: "user", content: message },
-		],
-	});
-
-	const newPlan =
-		aiResult?.result || aiResult?.response || "Could not revise plan.";
-
-	const session = {
-		id: String(Date.now()),
-		timestamp: Date.now(),
-		goal,
-		action: "revise_plan",
-		plan: newPlan,
-		outcomeNote: null,
-	};
-
-	const sessions = Array.isArray(state.sessions) ? state.sessions.slice() : [];
-	sessions.push(session);
-
-	const newState = {
-		...state,
-		lastSession: session,
-		sessions,
-	};
-
-	return { reply: newPlan, newState };
+/**
+ * Heuristic to detect if the user wants a factual answer ("How do pointers work?")
+ * vs a planning action ("Plan my day").
+ * 
+ * LOGIC:
+ * - Must end in a question mark.
+ * - Must NOT contain planning keywords (schedule, block).
+ * - Must NOT contain self-referential pronouns (I, me, my), as those usually imply personalized advice.
+ */
+function isDirectQuestion(message) {
+  if (!message) return false;
+  const trimmed = message.trim();
+  if (/\b(plan|schedule|session|block)\b/i.test(trimmed)) return false;
+  return /[?？！]$/.test(trimmed) && !/\b(we|I|me|my)\b/i.test(trimmed);
 }
 
-async function logOutcome(state, message, env) {
-	const lastPlan = state.lastSession ? state.lastSession.plan : "(none)";
+// --- ROUTING ---
 
-	const systemPrompt = `
-    The user is reporting how their last study session went.
-    Last plan:
-    ${lastPlan}
+/**
+ * The "Brain" of the agent. It classifies the user's intent to select the right AI prompt.
+ * 
+ * PRIORITY ORDER:
+ * 1. Analysis (meta-discussion about habits).
+ * 2. Logging outcomes (reporting on a past session).
+ * 3. Creating/Revising plans (explicit keywords).
+ * 4. Contextual Agreement (User says "ok" -> implies continuing current flow).
+ * 5. General Chat (Fallback / Clarification).
+ */
+function chooseAction(state, message) {
+  const text = (message || "").toLowerCase();
+  
+  // 1. Analyze Patterns
+  if (/\b(analy[sz]e|pattern|habit|trend|history)\b/.test(text)) {
+    return "analyze_pattern";
+  }
 
-    Summarize what worked and what didn't, and give one concrete suggestion for next time.
-    Be concise.
-  `;
+  // 2. Log Outcome
+  // We only check this if `state.lastSession` exists, because you can't "finish" a plan that doesn't exist.
+  if (
+    /\b(finished|completed|done|did it|failed|stuck|fell behind)\b/.test(text) &&
+    state.lastSession
+  ) {
+    return "log_outcome";
+  }
 
-	const aiResult = await env.AI.run(MODEL, {
-		messages: [
-			{ role: "system", content: systemPrompt },
-			{ role: "user", content: message },
-		],
-	});
+  // 3. Planning Triggers (Explicit keywords)
+  if (/\b(plan|schedule|agenda|block|timetable|routine)\b/.test(text)) {
+    // If a session already exists, we assume they want to REVISE it, otherwise CREATE new.
+    return state.lastSession ? "revise_plan" : "create_plan";
+  }
 
-	const reply =
-		aiResult?.result || aiResult?.response || "Thanks for the update.";
+  // 4. Revision Triggers (Explicit change requests)
+  if (
+    /\b(change|adjust|revise|modify|tweak|shorter|longer)\b/.test(text) &&
+    state.lastSession
+  ) {
+    return "revise_plan";
+  }
 
-	// Update sessions: attach outcomeNote to the latest session if present
-	const sessions = Array.isArray(state.sessions) ? state.sessions.slice() : [];
-	if (sessions.length > 0) {
-		const lastIndex = sessions.length - 1;
-		sessions[lastIndex] = {
-			...sessions[lastIndex],
-			outcomeNote: message,
-		};
-	} else {
-		// No previous sessions; create a standalone log entry
-		sessions.push({
-			id: String(Date.now()),
-			timestamp: Date.now(),
-			goal: state.lastSession?.goal || "(unknown goal)",
-			action: "log_outcome",
-			plan: state.lastSession?.plan || null,
-			outcomeNote: message,
-		});
-	}
+  // 5. Implicit "Let's do it" (Contextual Agreement)
+  // PROBLEM SOLVED: Previously, if the user said "ok", the bot treated it as a greeting.
+  // NOW: We route this to `general_chat`, but the prompt there knows to look at history 
+  // to see what we are agreeing to.
+  if (/^(ok|okay|sure|fine|yes|go ahead|do it)$/.test(text)) {
+    return "general_chat";
+  }
 
-	const newLastSession = state.lastSession
-		? { ...state.lastSession, outcomeNote: message }
-		: state.lastSession;
+  // 6. Direct Study Intent
+  // If they say "I want to study X", we default to creating a plan.
+  if (/\b(study|learn|review|prep|prepare)\b/.test(text)) {
+    return "create_plan"; 
+  }
 
-	const newState = {
-		...state,
-		lastSession: newLastSession,
-		sessions,
-	};
+  // 7. Direct Factual Question
+  // Uses the helper to detect "What is a pointer?" vs "How do I study pointers?"
+  if (isDirectQuestion(message)) {
+    return "direct_answer";
+  }
 
-	return { reply, newState };
+  // 8. Fallback
+  // Handles greetings ("Hi"), vague complaints ("I'm tired"), or clarifying questions.
+  return "general_chat";
 }
 
-async function analyzePattern(state, message, env) {
-	const sessions = Array.isArray(state.sessions) ? state.sessions : [];
+// --- HANDLERS ---
 
-	const systemPrompt = `
-    You are analyzing a student's study sessions.
+/**
+ * Handler: General Chat
+ * PURPOSE: Acts as a buffer/bridge. It builds context before locking in a structured plan.
+ * 
+ * PROMPT STRATEGY:
+ * - It sees `recentHistory` so it knows what was just said.
+ * - Instructions explicitly tell it to "Move towards a plan". 
+ * - Prevents the bot from becoming a passive listener.
+ */
+async function handleGeneralChat(state, message, env) {
+  const historyStr = formatHistory(state.recentHistory);
+  
+  const systemPrompt = `
+You are a study strategy consultant.
 
-    Study history (JSON):
-    ${JSON.stringify(sessions)}
+CONTEXT (Last few messages):
+${historyStr}
 
-    The user may add a comment or question:
-    ${message || "(no additional comment)"}
+CURRENT USER MESSAGE: "${message}"
 
-    Identify 2–3 patterns in their behavior:
-    - what kinds of goals or topics recur
-    - where they tend to get stuck or cut sessions short
-    - any timing or energy patterns you can infer
+YOUR GOAL:
+- Move the conversation towards creating a concrete study plan.
+- Do NOT get stuck in small talk loops.
+- If the user has identified a topic (like "C programming" or "Exam"), propose a specific next step.
+- If the user answers "ok" or "sure", interpret that as agreement to your previous suggestion.
 
-    Then give 1–2 concrete, practical suggestions for adjusting future study plans.
-    Be concise and specific.
-  `;
-
-	const aiResult = await env.AI.run(MODEL, {
-		messages: [
-			{ role: "system", content: systemPrompt },
-			{ role: "user", content: "Please analyze my study patterns." },
-		],
-	});
-
-	const summary =
-		aiResult?.result || aiResult?.response || "No clear patterns found yet.";
-
-	const newState = {
-		...state,
-		lastAnalysis: summary,
-	};
-
-	return { reply: summary, newState };
-}
-
-export default {
-	async fetch(request, env, ctx) {
-		const url = new URL(request.url);
-
-		// CORS preflight
-		if (request.method === "OPTIONS") {
-			return new Response(null, {
-				status: 204,
-				headers: {
-					...CORS_HEADERS,
-				},
-			});
-		}
-
-		// Reset state for demo
-		if (url.pathname === "/debug/reset") {
-			const userId = "demo-user";
-			await saveStudyState(env, userId, {
-				profile: {
-					prefersShortSentences: true,
-					weakAreas: [],
-				},
-				lastSession: null,
-				sessions: [],
-				lastAnalysis: null,
-			});
-			return new Response(JSON.stringify({ reset: true }), {
-				headers: {
-					"Content-Type": "application/json",
-					...CORS_HEADERS,
-				},
-			});
-		}
-
-		// Health check
-		if (url.pathname === "/api/health") {
-			return new Response(JSON.stringify({ ok: true }), {
-				headers: {
-					"Content-Type": "application/json",
-					...CORS_HEADERS,
-				},
-			});
-		}
-
-		// Debug: inspect stored state
-		if (url.pathname === "/debug/state") {
-			const userId = "demo-user";
-			const state = await loadStudyState(env, userId);
-			return new Response(JSON.stringify(state), {
-				headers: {
-					"Content-Type": "application/json",
-					...CORS_HEADERS,
-				},
-			});
-		}
-
-		if (url.pathname === "/api/chat" && request.method === "POST") {
-			const { message } = await request.json();
-			const userId = "demo-user";
-
-			// 1) Load state from KV
-			const state = await loadStudyState(env, userId);
-
-			// 2) Router: decide which action to use
-			const routerPrompt = `
-You are a strict router for a study assistant. 
-Your ONLY job is to choose one action label, NOT to give study advice.
-
-You must choose exactly one of these actions:
-
-1) "create_plan"
-   Use when:
-   - The user is starting a new study block (e.g. "I have 60 minutes to study X")
-   - OR there is no valid existing plan (no lastSession or sessions are empty)
-   - OR the user clearly wants a fresh plan from scratch ("start over", "new plan", etc.)
-
-2) "revise_plan"
-   Use when:
-   - There IS an existing plan (lastSession is not null)
-   - AND the user says the plan didn't work, needs adjustment, or constraints changed
-     Examples: "that was too slow", "make it more aggressive", 
-               "I only have 30 minutes now", "focus this on practice problems".
-
-3) "log_outcome"
-   Use when:
-   - The user is reporting how a session went, not asking for a new plan
-     Examples: "I finished most of it", "I got distracted near the end",
-               "I didn't do anything", "I completed everything".
-
-4) "analyze_pattern"
-   Use when:
-   - The user is asking about their habits or patterns across time, or asking what you notice
-     Examples: "analyze my study habits", "what patterns do you see?",
-               "what do you notice about how I study?", "how can I improve long term?"
-
-IMPORTANT DECISION RULES:
-- If state.lastSession is null OR state.sessions is empty, you MUST choose "create_plan",
-  even if the user mentions revising or logging outcome.
-- If the user is clearly asking for a new or different plan, but not talking about patterns,
-  choose "create_plan" or "revise_plan" (not "analyze_pattern").
-- If the user is clearly asking you to analyze history or patterns, choose "analyze_pattern",
-  not "create_plan" or "revise_plan".
-
-Current state (JSON):
-${JSON.stringify(state)}
-
-User message:
-${message}
-
-Respond with a JSON object ONLY, with this exact shape:
-{"action":"create_plan"}
-
-Allowed values for "action": "create_plan", "revise_plan", "log_outcome", "analyze_pattern".
-Do NOT add any other keys. Do NOT add explanations. Do NOT use code fences.
+EXAMPLES:
+- History includes "I want to learn C". User says "I know Python". You say: "Great. Since you know Python, we can skip basic loops and focus on Pointers. Shall I create a 1-week schedule?"
 `;
 
+  const aiResult = await env.AI.run(MODEL, {
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: message },
+    ],
+    // 500 tokens is enough for a conversational reply, but prevents rambling.
+    max_tokens: 500, 
+  });
 
-			const routerResult = await env.AI.run(MODEL, {
-				messages: [
-					{ role: "system", content: routerPrompt },
-					{ role: "user", content: message },
-				],
-			});
+  const reply = aiResult?.result || aiResult?.response || "How can I help you study today?";
+  return { reply, newState: state };
+}
 
-			const routerText =
-				routerResult?.result ||
-				routerResult?.response ||
-				'{"action":"create_plan"}';
+/**
+ * Handler: Direct Answer
+ * PURPOSE: Answer factual questions without messing up the planning state.
+ * No state changes occur here.
+ */
+async function answerDirectQuestion(state, message, env) {
+  const systemPrompt = `Answer the user's factual question directly and concisely (max 3 sentences). Do not offer a plan.`;
+  const aiResult = await env.AI.run(MODEL, {
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: message },
+    ],
+    max_tokens: 300, 
+  });
+  return { reply: aiResult?.result || aiResult?.response || "I don't know.", newState: state };
+}
 
-			let action = "create_plan";
-			try {
-				const parsed = JSON.parse(routerText);
-				if (parsed && typeof parsed.action === "string") {
-					action = parsed.action;
-				}
-			} catch (e) {
-				// fallback to create_plan
-			}
+/**
+ * Handler: Create Plan
+ * PURPOSE: The core value proposition. Generates a structured study schedule.
+ * 
+ * KEY FIX: `max_tokens: 2048`.
+ * Previously, detailed plans were getting cut off mid-sentence because the default
+ * token limit is usually 256. We increased this significantly to allow for
+ * bulleted lists and multi-week breakdowns.
+ */
+async function createPlan(state, message, env) {
+  const historyStr = formatHistory(state.recentHistory);
 
-			// 3) Execute chosen action
-			let outcome;
-			if (action === "revise_plan") {
-				outcome = await revisePlan(state, message, env);
-			} else if (action === "log_outcome") {
-				outcome = await logOutcome(state, message, env);
-			} else if (action === "analyze_pattern") {
-				outcome = await analyzePattern(state, message, env);
-			} else {
-				outcome = await createPlan(state, message, env);
-			}
+  const systemPrompt = `
+You are a study planner. Create a concrete, bulleted study block plan.
 
-			// 4) Save updated state
-			await saveStudyState(env, userId, outcome.newState);
+CONTEXT (Recent Chat - Use this for topic/constraints):
+${historyStr}
 
-			// 5) Return reply and action (for debugging)
-			return new Response(JSON.stringify({ reply: outcome.reply, action }), {
-				headers: {
-					"Content-Type": "application/json",
-					...CORS_HEADERS,
-				},
-			});
-		}
+USER REQUEST: "${message}"
 
-		// Default response
-		return new Response("error", {
-			status: 404,
-			headers: {
-				"Content-Type": "text/plain",
-				...CORS_HEADERS,
-			},
-		});
-	},
+RULES:
+1. Infer the topic from the chat history if not explicitly stated in this specific message.
+2. If the user mentions a long timeframe (e.g., "1 month"), provide a high-level breakdown AND a detailed plan for the *first* session.
+3. Be specific (e.g., "Read Chapter 1", "Practice 3 exercises").
+4. No fluff.
+`;
+
+  const aiResult = await env.AI.run(MODEL, {
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: message },
+    ],
+    max_tokens: 2048, // Critical for avoiding response cutoff
+  });
+
+  const planText = aiResult?.result || aiResult?.response || "Could not generate plan.";
+
+  // Store the plan in `lastSession` (the active goal) AND append to `sessions` (log).
+  const session = {
+    id: String(Date.now()),
+    timestamp: Date.now(),
+    goal: message,
+    action: "create_plan",
+    plan: planText,
+    outcomeNote: null,
+  };
+
+  const sessions = [...state.sessions, session];
+
+  return { 
+    reply: planText, 
+    newState: { ...state, lastSession: session, sessions } 
+  };
+}
+
+/**
+ * Handler: Revise Plan
+ * PURPOSE: Takes the existing plan (from state) and modifies it based on user feedback.
+ */
+async function revisePlan(state, message, env) {
+  const lastPlan = state.lastSession ? state.lastSession.plan : "No active plan.";
+  const systemPrompt = `
+Revise this study plan based on user feedback.
+Old Plan: ${lastPlan}
+Feedback: ${message}
+Output: A new bulleted plan.
+`;
+  const aiResult = await env.AI.run(MODEL, {
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: message },
+    ],
+    max_tokens: 2048, 
+  });
+  const newPlan = aiResult?.result || aiResult?.response || "Could not revise plan.";
+  
+  // Update the existing session plan rather than creating a brand new log entry,
+  // though we do save it to history.
+  const session = {
+    ...state.lastSession,
+    id: String(Date.now()),
+    timestamp: Date.now(),
+    action: "revise_plan",
+    plan: newPlan,
+  };
+
+  return { 
+    reply: newPlan, 
+    newState: { ...state, lastSession: session, sessions: [...state.sessions, session] } 
+  };
+}
+
+/**
+ * Handler: Log Outcome
+ * PURPOSE: Allows the user to say "I finished" or "I failed".
+ * The AI gives feedback/tips based on the result.
+ */
+async function logOutcome(state, message, env) {
+  const lastPlan = state.lastSession ? state.lastSession.plan : "(No plan)";
+  const systemPrompt = `
+User reported outcome for plan:
+${lastPlan}
+User Report: ${message}
+Task: Give 1 sentence of feedback and 1 specific tip for next time.
+`;
+  const aiResult = await env.AI.run(MODEL, {
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: message },
+    ],
+    max_tokens: 300,
+  });
+  const reply = aiResult?.result || aiResult?.response || "Logged.";
+  
+  // We update the specific session in the history with the outcome note.
+  const sessions = [...state.sessions];
+  if (sessions.length > 0) {
+    sessions[sessions.length - 1].outcomeNote = message;
+  }
+
+  return { reply, newState: { ...state, lastSession: { ...state.lastSession, outcomeNote: message }, sessions } };
+}
+
+/**
+ * Handler: Analyze Pattern
+ * PURPOSE: Looks at the `sessions` array (long-term memory) to find trends.
+ * e.g., "You always study late at night."
+ */
+async function analyzePattern(state, message, env) {
+  const sessions = state.sessions || [];
+  // We only send the last 10 sessions to keep the context size reasonable.
+  const systemPrompt = `
+Analyze these study sessions: ${JSON.stringify(sessions.slice(-10))}
+User Question: ${message}
+Output: 2 trends and 1 suggestion. Max 100 words.
+`;
+  const aiResult = await env.AI.run(MODEL, {
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: "Analyze my patterns" },
+    ],
+    max_tokens: 500,
+  });
+  return { reply: aiResult?.result || aiResult?.response || "No data.", newState: { ...state, lastAnalysis: aiResult?.result } };
+}
+
+// --- MAIN ---
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    // Handle Preflight CORS requests (browser security requirement)
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+
+    // Health check (useful for monitoring uptime)
+    if (url.pathname === "/api/health") {
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+      });
+    }
+
+    // Debugging Route: View current state in JSON format
+    if (url.pathname === "/debug/state") {
+      const userId = "demo-user";
+      const state = await loadStudyState(env, userId);
+      return new Response(JSON.stringify(state), {
+        headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+      });
+    }
+
+    // Debugging Route: Wipe state clean to start over
+    if (url.pathname === "/debug/reset") {
+      const userId = "demo-user";
+      await saveStudyState(env, userId, {
+        recentHistory: [],
+        sessions: [],
+        lastSession: null,
+      });
+      return new Response(JSON.stringify({ reset: true }), {
+        headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+      });
+    }
+
+    // --- CHAT ENDPOINT (The main interaction) ---
+
+    if (url.pathname === "/api/chat" && request.method === "POST") {
+      const { message } = await request.json();
+      const userId = "demo-user"; // Hardcoded for this demo; normally pulled from auth token
+
+      // 1. Load context
+      let state = await loadStudyState(env, userId);
+      
+      // 2. Decide what to do
+      const action = chooseAction(state, message);
+
+      // 3. Execute logic
+      let outcome;
+      if (action === "direct_answer") outcome = await answerDirectQuestion(state, message, env);
+      else if (action === "create_plan") outcome = await createPlan(state, message, env);
+      else if (action === "revise_plan") outcome = await revisePlan(state, message, env);
+      else if (action === "log_outcome") outcome = await logOutcome(state, message, env);
+      else if (action === "analyze_pattern") outcome = await analyzePattern(state, message, env);
+      else outcome = await handleGeneralChat(state, message, env);
+
+      // 4. Append interaction to recent history (Short-term memory)
+      const updatedHistory = [
+        ...state.recentHistory,
+        { role: "user", content: message },
+        { role: "assistant", content: outcome.reply }
+      ];
+
+      // 5. Save updated state to KV
+      const finalState = {
+        ...outcome.newState,
+        recentHistory: updatedHistory
+      };
+
+      await saveStudyState(env, userId, finalState);
+
+      // 6. Return response to frontend
+      return new Response(JSON.stringify({ reply: outcome.reply, action }), {
+        headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+      });
+    }
+
+    return new Response("Not Found", { status: 404, headers: CORS_HEADERS });
+  },
 };
