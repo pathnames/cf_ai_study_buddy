@@ -87,9 +87,7 @@ function App() {
         <div>
           <h1>Study Agent on Cloudflare</h1>
           <p className="subtitle">
-            LLM + KV + agentic routing. The model chooses actions like{" "}
-            <code>create_plan</code>, <code>revise_plan</code>,{" "}
-            <code>log_outcome</code>, and <code>analyze_pattern</code>.
+            LLM + KV + agentic routing. 
           </p>
         </div>
         <div className="header-controls">
@@ -133,7 +131,7 @@ function App() {
             <textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder="Example: I have 75 minutes to review orgo resonance and practice problems."
+              placeholder="Example: I have 75 minutes to study Cloudflare Durable Objects."
               onKeyDown={(e) => {
                 if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
                   e.preventDefault();

@@ -14,9 +14,5 @@
 	],
 	"ai": {
 		"binding": "AI"
-	},
-	"assets": {
-		"directory": "./pages",
-		"binding": "ASSETS"
 	}
 }
