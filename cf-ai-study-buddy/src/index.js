@@ -1,18 +1,21 @@
-/**
- * Welcome to Cloudflare Workers! This is your first worker.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run `npm run deploy` to publish your worker
- *
- * Learn more at https://developers.cloudflare.com/workers/
- */
-
 const MODEL = "@cf/meta/llama-3.1-8b-instruct-fast";
+
+
 async function loadStudyState(env, userId) {
 	const key = `user:${userId}`;
 	const stored = await env.STUDY_STATE_KV.get(key, "json");
-	if (stored) return stored;
+	if (stored) {
+		// Ensure newer fields exist
+		return {
+			profile: stored.profile || {
+				prefersShortSentences: true,
+				weakAreas: [],
+			},
+			lastSession: stored.lastSession || null,
+			sessions: Array.isArray(stored.sessions) ? stored.sessions : [],
+			lastAnalysis: stored.lastAnalysis || null,
+		};
+	}
 
 	// default state if nothing is stored yet
 	return {
@@ -20,7 +23,9 @@ async function loadStudyState(env, userId) {
 			prefersShortSentences: true,
 			weakAreas: [],
 		},
-		lastSession: null, // or { timestamp, goal, plan }
+		lastSession: null,
+		sessions: [],
+		lastAnalysis: null,
 	};
 }
 
@@ -53,13 +58,22 @@ async function createPlan(state, message, env) {
 	const planText =
 		aiResult?.result || aiResult?.response || "Could not generate plan.";
 
+	const session = {
+		id: String(Date.now()),
+		timestamp: Date.now(),
+		goal: message,
+		action: "create_plan",
+		plan: planText,
+		outcomeNote: null,
+	};
+
+	const sessions = Array.isArray(state.sessions) ? state.sessions.slice() : [];
+	sessions.push(session);
+
 	const newState = {
 		...state,
-		lastSession: {
-			timestamp: Date.now(),
-			goal: message,
-			plan: planText,
-		},
+		lastSession: session,
+		sessions,
 	};
 
 	return { reply: planText, newState };
@@ -67,6 +81,8 @@ async function createPlan(state, message, env) {
 
 async function revisePlan(state, message, env) {
 	const lastPlan = state.lastSession ? state.lastSession.plan : "(none)";
+	const goal =
+		(state.lastSession && state.lastSession.goal) || message || "(unspecified goal)";
 
 	const systemPrompt = `
     You are revising an existing study plan.
@@ -88,12 +104,22 @@ async function revisePlan(state, message, env) {
 	const newPlan =
 		aiResult?.result || aiResult?.response || "Could not revise plan.";
 
+	const session = {
+		id: String(Date.now()),
+		timestamp: Date.now(),
+		goal,
+		action: "revise_plan",
+		plan: newPlan,
+		outcomeNote: null,
+	};
+
+	const sessions = Array.isArray(state.sessions) ? state.sessions.slice() : [];
+	sessions.push(session);
+
 	const newState = {
 		...state,
-		lastSession: {
-			...(state.lastSession || { timestamp: Date.now(), goal: "(unknown)" }),
-			plan: newPlan,
-		},
+		lastSession: session,
+		sessions,
 	};
 
 	return { reply: newPlan, newState };
@@ -118,21 +144,100 @@ async function logOutcome(state, message, env) {
 		],
 	});
 
-	const reply = aiResult?.result || aiResult?.response || "Thanks for the update.";
+	const reply =
+		aiResult?.result || aiResult?.response || "Thanks for the update.";
+
+	// Update sessions: attach outcomeNote to the latest session if present
+	const sessions = Array.isArray(state.sessions) ? state.sessions.slice() : [];
+	if (sessions.length > 0) {
+		const lastIndex = sessions.length - 1;
+		sessions[lastIndex] = {
+			...sessions[lastIndex],
+			outcomeNote: message,
+		};
+	} else {
+		// No previous sessions; create a standalone log entry
+		sessions.push({
+			id: String(Date.now()),
+			timestamp: Date.now(),
+			goal: state.lastSession?.goal || "(unknown goal)",
+			action: "log_outcome",
+			plan: state.lastSession?.plan || null,
+			outcomeNote: message,
+		});
+	}
+
+	const newLastSession = state.lastSession
+		? { ...state.lastSession, outcomeNote: message }
+		: state.lastSession;
 
 	const newState = {
 		...state,
-		lastSession: state.lastSession
-			? { ...state.lastSession, outcomeNote: message }
-			: null,
+		lastSession: newLastSession,
+		sessions,
 	};
 
 	return { reply, newState };
 }
 
+async function analyzePattern(state, message, env) {
+	const sessions = Array.isArray(state.sessions) ? state.sessions : [];
+
+	const systemPrompt = `
+    You are analyzing a student's study sessions.
+
+    Study history (JSON):
+    ${JSON.stringify(sessions)}
+
+    The user may add a comment or question:
+    ${message || "(no additional comment)"}
+
+    Identify 2–3 patterns in their behavior:
+    - what kinds of goals or topics recur
+    - where they tend to get stuck or cut sessions short
+    - any timing or energy patterns you can infer
+
+    Then give 1–2 concrete, practical suggestions for adjusting future study plans.
+    Be concise and specific.
+  `;
+
+	const aiResult = await env.AI.run(MODEL, {
+		messages: [
+			{ role: "system", content: systemPrompt },
+			{ role: "user", content: "Please analyze my study patterns." },
+		],
+	});
+
+	const summary =
+		aiResult?.result || aiResult?.response || "No clear patterns found yet.";
+
+	const newState = {
+		...state,
+		lastAnalysis: summary,
+	};
+
+	return { reply: summary, newState };
+}
+
 export default {
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
+
+		if (url.pathname === "/debug/reset") {
+			const userId = "demo-user";
+			await saveStudyState(env, userId, {
+				profile: {
+					prefersShortSentences: true,
+					weakAreas: [],
+				},
+				lastSession: null,
+				sessions: [],
+				lastAnalysis: null,
+			});
+			return new Response(JSON.stringify({ reset: true }), {
+				headers: { "Content-Type": "application/json" },
+			});
+		}
 
 		// Health check (optional)
 		if (url.pathname === "/api/health") {
@@ -142,7 +247,6 @@ export default {
 		}
 
 		// Debug: inspect stored state
-		// 
 		if (url.pathname === "/debug/state") {
 			const userId = "demo-user";
 			const state = await loadStudyState(env, userId);
@@ -150,6 +254,7 @@ export default {
 				headers: { "Content-Type": "application/json" },
 			});
 		}
+
 		if (url.pathname === "/api/chat" && request.method === "POST") {
 			const { message } = await request.json();
 
@@ -166,6 +271,8 @@ export default {
     - "create_plan": user is starting a new study block or there is no valid existing plan.
     - "revise_plan": user says the plan didn't work, needs adjustment, or time changed.
     - "log_outcome": user is reporting how a session went, not asking for a new plan.
+    - "analyze_pattern": user is asking you to review their history, habits, or patterns,
+      or asking what you notice about how they study across sessions.
 
     Current state:
     ${JSON.stringify(state)}
@@ -185,7 +292,9 @@ export default {
 			});
 
 			const routerText =
-				routerResult?.result || routerResult?.response || '{"action":"create_plan"}';
+				routerResult?.result ||
+				routerResult?.response ||
+				'{"action":"create_plan"}';
 
 			let action = "create_plan";
 			try {
@@ -203,6 +312,8 @@ export default {
 				outcome = await revisePlan(state, message, env);
 			} else if (action === "log_outcome") {
 				outcome = await logOutcome(state, message, env);
+			} else if (action === "analyze_pattern") {
+				outcome = await analyzePattern(state, message, env);
 			} else {
 				outcome = await createPlan(state, message, env);
 			}
@@ -216,7 +327,7 @@ export default {
 			});
 		}
 
-		// Default response 
+		// Default response
 		return new Response("error");
 	},
 };
