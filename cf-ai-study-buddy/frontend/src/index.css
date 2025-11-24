@@ -1,0 +1,258 @@
+:root {
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #111;
+  background-color: #f3f4f6;
+}
+
+body {
+  margin: 0;
+}
+
+.app-root {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-header {
+  padding: 1.25rem 1.75rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.5rem;
+  background: #111827;
+  color: #f9fafb;
+}
+
+.app-header h1 {
+  margin: 0;
+  font-size: 1.4rem;
+}
+
+.subtitle {
+  margin: 0.25rem 0 0;
+  font-size: 0.9rem;
+  color: #d1d5db;
+}
+
+.header-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+button {
+  border: none;
+  border-radius: 999px;
+  padding: 0.4rem 0.9rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+  background: #2563eb;
+  color: white;
+}
+
+button.secondary {
+  background: #374151;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.health-pill {
+  border-radius: 999px;
+  padding: 0.25rem 0.7rem;
+  font-size: 0.75rem;
+  border: 1px solid;
+}
+
+.health-pill.ok {
+  border-color: #10b981;
+  color: #bbf7d0;
+}
+
+.health-pill.bad {
+  border-color: #f97373;
+  color: #fecaca;
+}
+
+.layout {
+  flex: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 2fr);
+  gap: 1.5rem;
+  padding: 1.5rem;
+}
+
+.panel {
+  background: white;
+  border-radius: 0.75rem;
+  padding: 1rem;
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.07);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.panel h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1rem;
+}
+
+.chat-panel {
+  min-height: 0;
+}
+
+.chat-window {
+  flex: 1;
+  overflow-y: auto;
+  border-radius: 0.5rem;
+  background: #f9fafb;
+  padding: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.chat-message {
+  margin-bottom: 0.75rem;
+}
+
+.chat-message.user .chat-text {
+  background: #e5e7eb;
+}
+
+.chat-message.assistant .chat-text {
+  background: #e0f2fe;
+}
+
+.chat-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.15rem;
+  font-size: 0.75rem;
+}
+
+.role-label {
+  font-weight: 600;
+}
+
+.action-label {
+  padding: 0.1rem 0.4rem;
+  border-radius: 999px;
+  background: #dbeafe;
+  font-family: monospace;
+  font-size: 0.7rem;
+}
+
+.chat-text {
+  padding: 0.5rem 0.7rem;
+  border-radius: 0.5rem;
+  white-space: pre-wrap;
+  font-size: 0.9rem;
+}
+
+.chat-input-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.chat-input-row textarea {
+  resize: vertical;
+  min-height: 80px;
+  max-height: 180px;
+  padding: 0.5rem;
+  border-radius: 0.5rem;
+  border: 1px solid #d1d5db;
+  font: inherit;
+}
+
+.error {
+  margin-top: 0.5rem;
+  color: #b91c1c;
+  font-size: 0.85rem;
+}
+
+.empty-hint {
+  font-size: 0.85rem;
+  color: #6b7280;
+}
+
+.state-panel {
+  gap: 0.75rem;
+}
+
+.state-block {
+  border-top: 1px solid #e5e7eb;
+  padding-top: 0.7rem;
+  margin-top: 0.7rem;
+}
+
+.state-block:first-of-type {
+  border-top: none;
+  padding-top: 0;
+  margin-top: 0;
+}
+
+.state-meta {
+  font-size: 0.8rem;
+  color: #4b5563;
+  margin-bottom: 0.4rem;
+}
+
+.plan-text,
+.analysis-text {
+  background: #f9fafb;
+  border-radius: 0.5rem;
+  padding: 0.6rem 0.7rem;
+  font-size: 0.9rem;
+  white-space: pre-wrap;
+}
+
+.note {
+  margin-top: 0.4rem;
+  font-size: 0.85rem;
+  color: #4b5563;
+}
+
+.table-wrapper {
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+
+th,
+td {
+  padding: 0.35rem 0.4rem;
+  border-bottom: 1px solid #e5e7eb;
+  text-align: left;
+  vertical-align: top;
+}
+
+.goal-cell {
+  max-width: 200px;
+}
+
+.outcome-cell {
+  max-width: 220px;
+}
+
+.app-footer {
+  padding: 0.6rem 1.75rem;
+  font-size: 0.8rem;
+  color: #6b7280;
+  border-top: 1px solid #e5e7eb;
+  background: #f9fafb;
+}
+
+@media (max-width: 900px) {
+  .layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

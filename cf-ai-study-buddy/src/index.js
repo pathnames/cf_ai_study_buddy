@@ -1,5 +1,10 @@
 const MODEL = "@cf/meta/llama-3.1-8b-instruct-fast";
 
+const CORS_HEADERS = {
+	"Access-Control-Allow-Origin": "*",
+	"Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+	"Access-Control-Allow-Headers": "Content-Type",
+};
 
 async function loadStudyState(env, userId) {
 	const key = `user:${userId}`;
@@ -223,6 +228,17 @@ export default {
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
 
+		// CORS preflight
+		if (request.method === "OPTIONS") {
+			return new Response(null, {
+				status: 204,
+				headers: {
+					...CORS_HEADERS,
+				},
+			});
+		}
+
+		// Reset state for demo
 		if (url.pathname === "/debug/reset") {
 			const userId = "demo-user";
 			await saveStudyState(env, userId, {
@@ -235,14 +251,20 @@ export default {
 				lastAnalysis: null,
 			});
 			return new Response(JSON.stringify({ reset: true }), {
-				headers: { "Content-Type": "application/json" },
+				headers: {
+					"Content-Type": "application/json",
+					...CORS_HEADERS,
+				},
 			});
 		}
 
-		// Health check (optional)
+		// Health check
 		if (url.pathname === "/api/health") {
 			return new Response(JSON.stringify({ ok: true }), {
-				headers: { "Content-Type": "application/json" },
+				headers: {
+					"Content-Type": "application/json",
+					...CORS_HEADERS,
+				},
 			});
 		}
 
@@ -251,13 +273,15 @@ export default {
 			const userId = "demo-user";
 			const state = await loadStudyState(env, userId);
 			return new Response(JSON.stringify(state), {
-				headers: { "Content-Type": "application/json" },
+				headers: {
+					"Content-Type": "application/json",
+					...CORS_HEADERS,
+				},
 			});
 		}
 
 		if (url.pathname === "/api/chat" && request.method === "POST") {
 			const { message } = await request.json();
-
 			const userId = "demo-user";
 
 			// 1) Load state from KV
@@ -265,24 +289,57 @@ export default {
 
 			// 2) Router: decide which action to use
 			const routerPrompt = `
-    You are a router for a study assistant.
+You are a strict router for a study assistant. 
+Your ONLY job is to choose one action label, NOT to give study advice.
 
-    You must choose exactly one of these actions:
-    - "create_plan": user is starting a new study block or there is no valid existing plan.
-    - "revise_plan": user says the plan didn't work, needs adjustment, or time changed.
-    - "log_outcome": user is reporting how a session went, not asking for a new plan.
-    - "analyze_pattern": user is asking you to review their history, habits, or patterns,
-      or asking what you notice about how they study across sessions.
+You must choose exactly one of these actions:
 
-    Current state:
-    ${JSON.stringify(state)}
+1) "create_plan"
+   Use when:
+   - The user is starting a new study block (e.g. "I have 60 minutes to study X")
+   - OR there is no valid existing plan (no lastSession or sessions are empty)
+   - OR the user clearly wants a fresh plan from scratch ("start over", "new plan", etc.)
 
-    User message:
-    ${message}
+2) "revise_plan"
+   Use when:
+   - There IS an existing plan (lastSession is not null)
+   - AND the user says the plan didn't work, needs adjustment, or constraints changed
+     Examples: "that was too slow", "make it more aggressive", 
+               "I only have 30 minutes now", "focus this on practice problems".
 
-    Respond with a JSON object only, no extra text, like:
-    {"action":"create_plan"}
-  `;
+3) "log_outcome"
+   Use when:
+   - The user is reporting how a session went, not asking for a new plan
+     Examples: "I finished most of it", "I got distracted near the end",
+               "I didn't do anything", "I completed everything".
+
+4) "analyze_pattern"
+   Use when:
+   - The user is asking about their habits or patterns across time, or asking what you notice
+     Examples: "analyze my study habits", "what patterns do you see?",
+               "what do you notice about how I study?", "how can I improve long term?"
+
+IMPORTANT DECISION RULES:
+- If state.lastSession is null OR state.sessions is empty, you MUST choose "create_plan",
+  even if the user mentions revising or logging outcome.
+- If the user is clearly asking for a new or different plan, but not talking about patterns,
+  choose "create_plan" or "revise_plan" (not "analyze_pattern").
+- If the user is clearly asking you to analyze history or patterns, choose "analyze_pattern",
+  not "create_plan" or "revise_plan".
+
+Current state (JSON):
+${JSON.stringify(state)}
+
+User message:
+${message}
+
+Respond with a JSON object ONLY, with this exact shape:
+{"action":"create_plan"}
+
+Allowed values for "action": "create_plan", "revise_plan", "log_outcome", "analyze_pattern".
+Do NOT add any other keys. Do NOT add explanations. Do NOT use code fences.
+`;
+
 
 			const routerResult = await env.AI.run(MODEL, {
 				messages: [
@@ -323,11 +380,20 @@ export default {
 
 			// 5) Return reply and action (for debugging)
 			return new Response(JSON.stringify({ reply: outcome.reply, action }), {
-				headers: { "Content-Type": "application/json" },
+				headers: {
+					"Content-Type": "application/json",
+					...CORS_HEADERS,
+				},
 			});
 		}
 
 		// Default response
-		return new Response("error");
+		return new Response("error", {
+			status: 404,
+			headers: {
+				"Content-Type": "text/plain",
+				...CORS_HEADERS,
+			},
+		});
 	},
 };
