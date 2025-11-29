@@ -456,9 +456,14 @@ export default {
         recentHistory: updatedHistory
       };
 
-      await saveStudyState(env, userId, finalState);
+      // Save updated state to KV
+      // We wrap the Promise in ctx.waitUntil(). 
+      // This tells Cloudflare: "Send the response NOW, but keep the worker alive 
+      // until this save finishes in the background."
+      ctx.waitUntil(saveStudyState(env, userId, finalState));
 
       // 6. Return response to frontend
+      // The user gets this immediately!
       return new Response(JSON.stringify({ reply: outcome.reply, action }), {
         headers: { "Content-Type": "application/json", ...CORS_HEADERS },
       });
